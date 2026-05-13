@@ -6,13 +6,8 @@
 	};
 
 	chosen {
-	#ifdef CONFIG_USB_DEVICE_STACK_NEXT
 		zephyr,console = &cdc_acm_uart0;
 		zephyr,shell-uart = &cdc_acm_uart0;
-	#else
-		zephyr,console = &uart0;
-		zephyr,shell-uart = &uart0;
-	#endif
 	};
 
 	sd_inputs {
@@ -72,13 +67,11 @@
 	};
 };
 
-#ifdef CONFIG_USB_DEVICE_STACK_NEXT
 &zephyr_udc0 {
 	cdc_acm_uart0: cdc_acm_uart0 {
 		compatible = "zephyr,cdc-acm-uart";
 	};
 };
-#endif
 
 &spi1 {
 	status = "okay";
