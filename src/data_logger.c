@@ -348,3 +348,8 @@ void data_logger_flush(void)
 {
     k_sem_give(&flush_sem);
 }
+
+void data_logger_flush_sync(void)
+{
+    flush_buffer();
+}

@@ -25,5 +25,6 @@ int data_logger_queue_sample(const char *device_name,
                              const struct Sample *sample);
 void data_logger_set_sample_period(uint16_t sample_period_ms);
 void data_logger_flush(void);
+void data_logger_flush_sync(void);
 
 #endif /* DATA_LOGGER_H */

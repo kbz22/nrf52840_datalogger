@@ -15,7 +15,7 @@
 LOG_MODULE_REGISTER(ble_sensor, LOG_LEVEL_INF);
 
 #define SENSOR_SUBSCRIBE_DELAY_MS 200
-#define SENSOR_DELAY_MS 1000
+#define SENSOR_DELAY_DEFAULT_MS 1000
 #define SENSOR_PING_DELAY_MS 50
 #define SENSOR_DELAY_READ_DELAY_MS 50
 
@@ -32,6 +32,7 @@ static struct bt_uuid_128 sensor_service_uuid = BT_UUID_INIT_128(BT_UUID_BLE_ICM
 static struct bt_uuid_128 sensor_delay_uuid = BT_UUID_INIT_128(BT_UUID_BLE_ICM_DELAY_VAL);
 static struct bt_uuid_128 sensor_data_uuid = BT_UUID_INIT_128(BT_UUID_BLE_ICM_DATA_VAL);
 static struct bt_uuid_128 sensor_ping_uuid = BT_UUID_INIT_128(BT_UUID_BLE_ICM_BLINK_VAL);
+static uint16_t sensor_delay_ms = SENSOR_DELAY_DEFAULT_MS;
 
 struct ble_sensor_conn {
     struct bt_conn *conn;
@@ -291,7 +292,7 @@ static void delay_write_cb(struct bt_conn *conn, uint8_t err,
 
     LOG_INF("Delay written (rsp)");
 
-    data_logger_set_sample_period(SENSOR_DELAY_MS);
+    data_logger_set_sample_period(sensor_delay_ms);
 
     schedule_delay_read(ctx);
 
@@ -307,7 +308,7 @@ static void start_write_sequence(struct ble_sensor_conn *ctx)
         return;
     }
 
-    ctx->delay_value = sys_cpu_to_le16(SENSOR_DELAY_MS);
+    ctx->delay_value = sys_cpu_to_le16(sensor_delay_ms);
     ctx->write_params.func = delay_write_cb;
     ctx->write_params.handle = ctx->delay_handle;
     ctx->write_params.offset = 0;
@@ -330,7 +331,7 @@ static void start_write_sequence(struct ble_sensor_conn *ctx)
     }
 
     LOG_INF("Delay written (no-rsp)");
-    data_logger_set_sample_period(SENSOR_DELAY_MS);
+    data_logger_set_sample_period(sensor_delay_ms);
     schedule_delay_read(ctx);
 
     (void)k_work_cancel_delayable(&ctx->ping_work);
@@ -454,6 +455,17 @@ int ble_sensor_init(void)
     return 0;
 }
 
+int ble_sensor_set_delay_ms(uint16_t delay_ms)
+{
+    if (delay_ms == 0U) {
+        return -EINVAL;
+    }
+
+    sensor_delay_ms = delay_ms;
+    LOG_INF("Configured sensor delay: %u ms", sensor_delay_ms);
+    return 0;
+}
+
 void ble_sensor_on_connected(struct bt_conn *conn, const char *device_name)
 {
     struct ble_sensor_conn *ctx = alloc_conn_ctx(conn);
@@ -491,6 +503,6 @@ void ble_sensor_on_disconnected(struct bt_conn *conn, uint8_t reason)
         return;
     }
 
-    data_logger_flush();
+    data_logger_flush_sync();
     clear_conn_ctx(ctx);
 }

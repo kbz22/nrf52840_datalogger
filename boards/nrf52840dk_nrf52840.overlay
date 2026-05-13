@@ -1,5 +1,30 @@
 
 /* SPI1 configuration for SD card (HW-125 module) */
+/ {
+	aliases {
+		sd-cd = &sd_cd;
+	};
+
+	chosen {
+	#ifdef CONFIG_USB_DEVICE_STACK_NEXT
+		zephyr,console = &cdc_acm_uart0;
+		zephyr,shell-uart = &cdc_acm_uart0;
+	#else
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+	#endif
+	};
+
+	sd_inputs {
+		compatible = "gpio-keys";
+
+		sd_cd: sd_card_detect {
+			gpios = <&gpio0 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "SD_CD";
+		};
+	};
+};
+
 &pinctrl {
 	spi1_default: spi1_default {
 		group1 {
@@ -47,6 +72,14 @@
 	};
 };
 
+#ifdef CONFIG_USB_DEVICE_STACK_NEXT
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+	};
+};
+#endif
+
 &spi1 {
 	status = "okay";
 	cs-gpios = <&gpio1 15 GPIO_ACTIVE_LOW>;
@@ -73,5 +106,20 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+&led0 {
+	gpios = <&gpio0 29 GPIO_ACTIVE_HIGH>;
+	label = "LED_SCAN";
+};
+
+&led1 {
+	gpios = <&gpio1 3 GPIO_ACTIVE_HIGH>;
+	label = "LED_CONN";
+};
+
+&button0 {
+	gpios = <&gpio1 1 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+	label = "BUTTON";
 };
 

@@ -7,6 +7,7 @@
 #include <zephyr/bluetooth/addr.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/util.h>
+#include <errno.h>
 #include <string.h>
 
 #include "ble.h"
@@ -19,6 +20,7 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 #define CONNECT_RETRY_DELAY_MS 1500
 
 #define MAX_CONN CONFIG_BT_MAX_CONN
+#define MAX_TARGET_NAME_LEN 32
 
 static const struct gpio_dt_spec *scan_led;
 static const struct gpio_dt_spec *conn_led;
@@ -40,9 +42,7 @@ static bt_addr_le_t pending_addrs[MAX_CONN];
 static bool pending_in_use[MAX_CONN];
 static size_t active_conn_count;
 
-static const char *const allowed_names[] = {
-    "crassus_sensor",
-};
+static char target_name[MAX_TARGET_NAME_LEN] = "crassus_sensor";
 
 static void set_led(const struct gpio_dt_spec *led, int value)
 {
@@ -127,12 +127,12 @@ static void remove_active_conn(struct bt_conn *conn)
 
 static bool name_matches_allowed(const uint8_t *name, size_t name_len)
 {
-    for (size_t i = 0; i < ARRAY_SIZE(allowed_names); i++) {
-        size_t allowed_len = strlen(allowed_names[i]);
-        if (name_len == allowed_len && memcmp(name, allowed_names[i], name_len) == 0) {
-            return true;
-        }
+    size_t target_len = strlen(target_name);
+
+    if (name_len == target_len && memcmp(name, target_name, name_len) == 0) {
+        return true;
     }
+
     return false;
 }
 
@@ -406,5 +406,25 @@ int ble_init(const struct gpio_dt_spec *scan_led_spec,
         return ret;
     }
 
+    return 0;
+}
+
+int ble_set_target_name(const char *name)
+{
+    size_t len;
+
+    if (name == NULL) {
+        return -EINVAL;
+    }
+
+    len = strlen(name);
+    if (len == 0U || len >= sizeof(target_name)) {
+        return -EINVAL;
+    }
+
+    strncpy(target_name, name, sizeof(target_name));
+    target_name[sizeof(target_name) - 1] = '\0';
+
+    LOG_INF("BLE target name set to '%s'", target_name);
     return 0;
 }
