@@ -45,8 +45,66 @@ static struct bt_conn *active_conns[MAX_CONN];
 static bt_addr_le_t pending_addrs[MAX_CONN];
 static bool pending_in_use[MAX_CONN];
 static size_t active_conn_count;
+static struct bt_conn *pending_create_conn;
 
 static char target_name[MAX_TARGET_NAME_LEN] = "crassus_sensor";
+
+static void remove_pending_addr(const bt_addr_le_t *addr);
+static void schedule_reconnect_scan(k_timeout_t delay);
+
+static void start_connection_attempt(void)
+{
+    if (!connect_addr_valid) {
+        atomic_set(&connect_in_progress, 0);
+        return;
+    }
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+    bt_addr_le_to_str(&connect_addr, addr_str, sizeof(addr_str));
+    LOG_INF("Connecting to %s", addr_str);
+
+    struct bt_conn *conn = NULL;
+    int ret = bt_conn_le_create(&connect_addr, BT_CONN_LE_CREATE_CONN,
+                                BT_LE_CONN_PARAM_DEFAULT, &conn);
+    if (ret != 0) {
+        LOG_WRN("Connect failed (%d)", ret);
+        remove_pending_addr(&connect_addr);
+        connect_addr_valid = false;
+        atomic_set(&connect_in_progress, 0);
+
+        if (atomic_get(&reconnect_mode) && active_conn_count == 0U) {
+            schedule_reconnect_scan(K_SECONDS(RECONNECT_SCAN_BACKOFF_SECONDS));
+        }
+
+        return;
+    }
+
+    if (conn == NULL) {
+        LOG_ERR("bt_conn_le_create succeeded with NULL conn");
+        return;
+    }
+
+    if (pending_create_conn != NULL) {
+        LOG_WRN("Releasing stale pending connect ref %p", pending_create_conn);
+        bt_conn_unref(pending_create_conn);
+        pending_create_conn = NULL;
+    }
+
+    pending_create_conn = conn;
+}
+
+static size_t count_active_conns(void)
+{
+    size_t count = 0U;
+
+    for (size_t i = 0; i < MAX_CONN; i++) {
+        if (active_conns[i] != NULL) {
+            count++;
+        }
+    }
+
+    return count;
+}
 
 static void schedule_reconnect_scan(k_timeout_t delay)
 {
@@ -80,6 +138,7 @@ static void set_led(const struct gpio_dt_spec *led, int value)
 
 static void update_conn_led(void)
 {
+    active_conn_count = count_active_conns();
     set_led(conn_led, active_conn_count > 0U ? 1 : 0);
 }
 
@@ -129,6 +188,21 @@ static bool addr_is_active(const bt_addr_le_t *addr)
 
 static void add_active_conn(struct bt_conn *conn)
 {
+    const bt_addr_le_t *new_dst = bt_conn_get_dst(conn);
+
+    for (size_t i = 0; i < MAX_CONN; i++) {
+        if (active_conns[i] == conn) {
+            return;
+        }
+
+        if (active_conns[i] != NULL) {
+            const bt_addr_le_t *dst = bt_conn_get_dst(active_conns[i]);
+            if (bt_addr_le_cmp(new_dst, dst) == 0) {
+                return;
+            }
+        }
+    }
+
     for (size_t i = 0; i < MAX_CONN; i++) {
         if (active_conns[i] == NULL) {
             active_conns[i] = bt_conn_ref(conn);
@@ -136,10 +210,14 @@ static void add_active_conn(struct bt_conn *conn)
             return;
         }
     }
+
+    LOG_WRN("No free active connection slots");
 }
 
 static void remove_active_conn(struct bt_conn *conn)
 {
+    const bt_addr_le_t *rm_dst = bt_conn_get_dst(conn);
+
     for (size_t i = 0; i < MAX_CONN; i++) {
         if (active_conns[i] == conn) {
             bt_conn_unref(active_conns[i]);
@@ -150,6 +228,23 @@ static void remove_active_conn(struct bt_conn *conn)
             return;
         }
     }
+
+    /* Fallback for cases where bt_conn pointer identity changed but peer address matches. */
+    for (size_t i = 0; i < MAX_CONN; i++) {
+        if (active_conns[i] != NULL) {
+            const bt_addr_le_t *dst = bt_conn_get_dst(active_conns[i]);
+            if (bt_addr_le_cmp(rm_dst, dst) == 0) {
+                bt_conn_unref(active_conns[i]);
+                active_conns[i] = NULL;
+                if (active_conn_count > 0U) {
+                    active_conn_count--;
+                }
+                return;
+            }
+        }
+    }
+
+    LOG_WRN("Disconnect for unknown connection");
 }
 
 static bool name_matches_allowed(const uint8_t *name, size_t name_len)
@@ -193,28 +288,7 @@ static void connect_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    if (!connect_addr_valid) {
-        atomic_set(&connect_in_progress, 0);
-        return;
-    }
-
-    struct bt_conn *conn = NULL;
-    int ret = bt_conn_le_create(&connect_addr, BT_CONN_LE_CREATE_CONN,
-                                BT_LE_CONN_PARAM_DEFAULT, &conn);
-    if (ret != 0) {
-        LOG_WRN("Connect failed (%d)", ret);
-        remove_pending_addr(&connect_addr);
-        connect_addr_valid = false;
-        atomic_set(&connect_in_progress, 0);
-
-        if (atomic_get(&reconnect_mode) && active_conn_count == 0U) {
-            schedule_reconnect_scan(K_SECONDS(RECONNECT_SCAN_BACKOFF_SECONDS));
-        }
-
-        return;
-    }
-
-    bt_conn_unref(conn);
+    start_connection_attempt();
 }
 
 static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
@@ -278,7 +352,8 @@ static void device_found(const bt_addr_le_t *addr, int8_t rssi, uint8_t type,
 
     connect_addr = *addr;
     connect_addr_valid = true;
-    k_work_schedule(&connect_work, K_MSEC(CONNECT_RETRY_DELAY_MS));
+    (void)k_work_cancel_delayable(&connect_work);
+    k_work_schedule(&connect_work, K_NO_WAIT);
 }
 
 static void scan_blink_timer_handler(struct k_timer *timer)
@@ -358,6 +433,12 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
     char addr_str[BT_ADDR_LE_STR_LEN];
 
     bt_addr_le_to_str(dst, addr_str, sizeof(addr_str));
+
+    if (pending_create_conn == conn) {
+        bt_conn_unref(pending_create_conn);
+        pending_create_conn = NULL;
+    }
+
     remove_pending_addr(dst);
     atomic_set(&connect_in_progress, 0);
     connect_addr_valid = false;
@@ -373,23 +454,7 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
     update_conn_led();
     LOG_INF("Connected: %s", addr_str);
 
-    int ret = bt_conn_le_phy_update(conn, BT_CONN_LE_PHY_PARAM_CODED);
-    if (ret != 0) {
-        LOG_WRN("PHY update request failed (%d)", ret);
-    }
-
     ble_sensor_on_connected(conn, connect_name);
-}
-
-static void bt_le_phy_updated(struct bt_conn *conn,
-                              struct bt_conn_le_phy_info *param)
-{
-    const bt_addr_le_t *dst = bt_conn_get_dst(conn);
-    char addr_str[BT_ADDR_LE_STR_LEN];
-
-    bt_addr_le_to_str(dst, addr_str, sizeof(addr_str));
-    LOG_INF("PHY updated for %s: TX=0x%02x RX=0x%02x", addr_str,
-            param->tx_phy, param->rx_phy);
 }
 
 static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -399,6 +464,11 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 
     bt_addr_le_to_str(dst, addr_str, sizeof(addr_str));
     LOG_INF("Disconnected: %s (reason %u)", addr_str, reason);
+
+    if (pending_create_conn == conn) {
+        bt_conn_unref(pending_create_conn);
+        pending_create_conn = NULL;
+    }
 
     remove_active_conn(conn);
     update_conn_led();
@@ -415,7 +485,6 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 static struct bt_conn_cb conn_callbacks = {
     .connected = bt_connected,
     .disconnected = bt_disconnected,
-    .le_phy_updated = bt_le_phy_updated,
 };
 
 int ble_init(const struct gpio_dt_spec *scan_led_spec,

@@ -492,17 +492,19 @@ void ble_sensor_on_connected(struct bt_conn *conn, const char *device_name)
         start_service_discovery(ctx);
         return;
     }
+
 }
 
 void ble_sensor_on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
-    ARG_UNUSED(reason);
-
     struct ble_sensor_conn *ctx = find_conn_ctx(conn);
     if (!ctx) {
+        LOG_INF("Disconnected sensor without context (reason %u)", reason);
         return;
     }
 
-    data_logger_flush_sync();
+    LOG_INF("Sensor disconnected for %s (reason %u)", ctx->device_addr, reason);
+
+    data_logger_flush();
     clear_conn_ctx(ctx);
 }

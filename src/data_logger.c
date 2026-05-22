@@ -32,6 +32,7 @@ struct log_record {
 #define LOG_BUFFER_SIZE 32
 #define LOG_FLUSH_PERCENT 80
 #define LOG_MIN_FLUSH_MS 200U
+#define LOG_DEFAULT_FLUSH_MS 1000U
 #define LOG_STACK_SIZE 2048
 #define LOG_THREAD_PRIO 5
 
@@ -269,11 +270,16 @@ int data_logger_init(const struct device *i2c_dev)
         return ret;
     }
 
+    (void)fs_sync(&log_file);
+
     LOG_INF("Logging to %s", path);
 
     k_thread_create(&log_thread, log_thread_stack, LOG_STACK_SIZE,
                     log_thread_fn, NULL, NULL, NULL,
                     LOG_THREAD_PRIO, 0, K_NO_WAIT);
+
+    flush_period_ms = LOG_DEFAULT_FLUSH_MS;
+    k_timer_start(&flush_timer, K_MSEC(flush_period_ms), K_MSEC(flush_period_ms));
 
     return 0;
 }
