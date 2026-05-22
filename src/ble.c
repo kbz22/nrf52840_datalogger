@@ -18,6 +18,8 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 #define SCAN_BLINK_PERIOD_MS 200
 #define SCAN_DURATION_SECONDS 10
 #define CONNECT_RETRY_DELAY_MS 1500
+#define RECONNECT_SCAN_DELAY_SECONDS 3
+#define RECONNECT_SCAN_BACKOFF_SECONDS 30
 
 #define MAX_CONN CONFIG_BT_MAX_CONN
 #define MAX_TARGET_NAME_LEN 32
@@ -28,6 +30,7 @@ static const struct gpio_dt_spec *user_button;
 
 static struct k_work scan_start_work;
 static struct k_work_delayable scan_stop_work;
+static struct k_work_delayable reconnect_scan_work;
 static struct k_timer scan_blink_timer;
 static struct gpio_callback button_cb_data;
 static atomic_t scan_active;
@@ -36,6 +39,7 @@ static int64_t last_connect_ms;
 static struct k_work_delayable connect_work;
 static bt_addr_le_t connect_addr;
 static bool connect_addr_valid;
+static atomic_t reconnect_mode;
 
 static struct bt_conn *active_conns[MAX_CONN];
 static bt_addr_le_t pending_addrs[MAX_CONN];
@@ -43,6 +47,29 @@ static bool pending_in_use[MAX_CONN];
 static size_t active_conn_count;
 
 static char target_name[MAX_TARGET_NAME_LEN] = "crassus_sensor";
+
+static void schedule_reconnect_scan(k_timeout_t delay)
+{
+    if (active_conn_count > 0U) {
+        return;
+    }
+
+    atomic_set(&reconnect_mode, 1);
+    (void)k_work_cancel_delayable(&reconnect_scan_work);
+    k_work_schedule(&reconnect_scan_work, delay);
+}
+
+static void reconnect_scan_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (active_conn_count > 0U) {
+        atomic_set(&reconnect_mode, 0);
+        return;
+    }
+
+    k_work_submit(&scan_start_work);
+}
 
 static void set_led(const struct gpio_dt_spec *led, int value)
 {
@@ -179,6 +206,11 @@ static void connect_work_handler(struct k_work *work)
         remove_pending_addr(&connect_addr);
         connect_addr_valid = false;
         atomic_set(&connect_in_progress, 0);
+
+        if (atomic_get(&reconnect_mode) && active_conn_count == 0U) {
+            schedule_reconnect_scan(K_SECONDS(RECONNECT_SCAN_BACKOFF_SECONDS));
+        }
+
         return;
     }
 
@@ -275,6 +307,12 @@ static void scan_stop_work_handler(struct k_work *work)
     k_timer_stop(&scan_blink_timer);
     set_led(scan_led, 0);
     LOG_INF("Scan stopped");
+
+    if (atomic_get(&reconnect_mode) &&
+        active_conn_count == 0U &&
+        !atomic_get(&connect_in_progress)) {
+        schedule_reconnect_scan(K_SECONDS(RECONNECT_SCAN_BACKOFF_SECONDS));
+    }
 }
 
 static void scan_start_work_handler(struct k_work *work)
@@ -330,10 +368,28 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
     }
 
     add_active_conn(conn);
+    atomic_set(&reconnect_mode, 0);
+    (void)k_work_cancel_delayable(&reconnect_scan_work);
     update_conn_led();
     LOG_INF("Connected: %s", addr_str);
 
+    int ret = bt_conn_le_phy_update(conn, BT_CONN_LE_PHY_PARAM_CODED);
+    if (ret != 0) {
+        LOG_WRN("PHY update request failed (%d)", ret);
+    }
+
     ble_sensor_on_connected(conn, connect_name);
+}
+
+static void bt_le_phy_updated(struct bt_conn *conn,
+                              struct bt_conn_le_phy_info *param)
+{
+    const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+
+    bt_addr_le_to_str(dst, addr_str, sizeof(addr_str));
+    LOG_INF("PHY updated for %s: TX=0x%02x RX=0x%02x", addr_str,
+            param->tx_phy, param->rx_phy);
 }
 
 static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -350,11 +406,16 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
     connect_addr_valid = false;
 
     ble_sensor_on_disconnected(conn, reason);
+
+    if (active_conn_count == 0U) {
+        schedule_reconnect_scan(K_SECONDS(RECONNECT_SCAN_DELAY_SECONDS));
+    }
 }
 
 static struct bt_conn_cb conn_callbacks = {
     .connected = bt_connected,
     .disconnected = bt_disconnected,
+    .le_phy_updated = bt_le_phy_updated,
 };
 
 int ble_init(const struct gpio_dt_spec *scan_led_spec,
@@ -390,6 +451,7 @@ int ble_init(const struct gpio_dt_spec *scan_led_spec,
     k_work_init(&scan_start_work, scan_start_work_handler);
     k_work_init_delayable(&scan_stop_work, scan_stop_work_handler);
     k_work_init_delayable(&connect_work, connect_work_handler);
+    k_work_init_delayable(&reconnect_scan_work, reconnect_scan_work_handler);
     k_timer_init(&scan_blink_timer, scan_blink_timer_handler, NULL);
 
     ret = bt_enable(NULL);
