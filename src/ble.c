@@ -20,6 +20,8 @@ LOG_MODULE_REGISTER(ble, LOG_LEVEL_INF);
 #define CONNECT_RETRY_DELAY_MS 1500
 #define RECONNECT_SCAN_DELAY_SECONDS 3
 #define RECONNECT_SCAN_BACKOFF_SECONDS 30
+#define PHY_UPDATE_DELAY_MS 1200
+#define BUTTON_DEBOUNCE_MS 150
 
 #define MAX_CONN CONFIG_BT_MAX_CONN
 #define MAX_TARGET_NAME_LEN 32
@@ -31,11 +33,13 @@ static const struct gpio_dt_spec *user_button;
 static struct k_work scan_start_work;
 static struct k_work_delayable scan_stop_work;
 static struct k_work_delayable reconnect_scan_work;
+static struct k_work_delayable phy_update_work;
 static struct k_timer scan_blink_timer;
 static struct gpio_callback button_cb_data;
 static atomic_t scan_active;
 static atomic_t connect_in_progress;
 static int64_t last_connect_ms;
+static int64_t last_button_event_ms;
 static struct k_work_delayable connect_work;
 static bt_addr_le_t connect_addr;
 static bool connect_addr_valid;
@@ -46,11 +50,47 @@ static bt_addr_le_t pending_addrs[MAX_CONN];
 static bool pending_in_use[MAX_CONN];
 static size_t active_conn_count;
 static struct bt_conn *pending_create_conn;
+static struct bt_conn *pending_phy_conn;
 
 static char target_name[MAX_TARGET_NAME_LEN] = "crassus_sensor";
 
 static void remove_pending_addr(const bt_addr_le_t *addr);
 static void schedule_reconnect_scan(k_timeout_t delay);
+
+static void schedule_phy_update(struct bt_conn *conn)
+{
+    if (conn == NULL) {
+        return;
+    }
+
+    if (pending_phy_conn != NULL) {
+        bt_conn_unref(pending_phy_conn);
+        pending_phy_conn = NULL;
+    }
+
+    pending_phy_conn = bt_conn_ref(conn);
+    (void)k_work_cancel_delayable(&phy_update_work);
+    k_work_schedule(&phy_update_work, K_MSEC(PHY_UPDATE_DELAY_MS));
+}
+
+static void phy_update_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    if (pending_phy_conn == NULL) {
+        return;
+    }
+
+    int ret = bt_conn_le_phy_update(pending_phy_conn, BT_CONN_LE_PHY_PARAM_CODED);
+    if (ret != 0) {
+        LOG_WRN("Delayed PHY update request failed (%d)", ret);
+    } else {
+        LOG_INF("Delayed PHY update requested");
+    }
+
+    bt_conn_unref(pending_phy_conn);
+    pending_phy_conn = NULL;
+}
 
 static void start_connection_attempt(void)
 {
@@ -424,6 +464,23 @@ static void button_pressed(const struct device *dev, struct gpio_callback *cb,
     ARG_UNUSED(cb);
     ARG_UNUSED(pins);
 
+    int64_t now = k_uptime_get();
+    if ((now - last_button_event_ms) < BUTTON_DEBOUNCE_MS) {
+        return;
+    }
+    last_button_event_ms = now;
+
+    /* Trigger manual scan on button release, not on press. */
+    int state = gpio_pin_get_dt(user_button);
+    if (state < 0) {
+        LOG_WRN("Button read failed: %d", state);
+        return;
+    }
+
+    if (state != 0) {
+        return;
+    }
+
     k_work_submit(&scan_start_work);
 }
 
@@ -454,7 +511,20 @@ static void bt_connected(struct bt_conn *conn, uint8_t err)
     update_conn_led();
     LOG_INF("Connected: %s", addr_str);
 
+    schedule_phy_update(conn);
+
     ble_sensor_on_connected(conn, connect_name);
+}
+
+static void bt_le_phy_updated(struct bt_conn *conn,
+                              struct bt_conn_le_phy_info *param)
+{
+    const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+    char addr_str[BT_ADDR_LE_STR_LEN];
+
+    bt_addr_le_to_str(dst, addr_str, sizeof(addr_str));
+    LOG_INF("PHY updated for %s: TX=0x%02x RX=0x%02x", addr_str,
+            param->tx_phy, param->rx_phy);
 }
 
 static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
@@ -468,6 +538,12 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
     if (pending_create_conn == conn) {
         bt_conn_unref(pending_create_conn);
         pending_create_conn = NULL;
+    }
+
+    if (pending_phy_conn == conn) {
+        (void)k_work_cancel_delayable(&phy_update_work);
+        bt_conn_unref(pending_phy_conn);
+        pending_phy_conn = NULL;
     }
 
     remove_active_conn(conn);
@@ -485,6 +561,7 @@ static void bt_disconnected(struct bt_conn *conn, uint8_t reason)
 static struct bt_conn_cb conn_callbacks = {
     .connected = bt_connected,
     .disconnected = bt_disconnected,
+    .le_phy_updated = bt_le_phy_updated,
 };
 
 int ble_init(const struct gpio_dt_spec *scan_led_spec,
@@ -508,7 +585,7 @@ int ble_init(const struct gpio_dt_spec *scan_led_spec,
         return ret;
     }
 
-    ret = gpio_pin_interrupt_configure_dt(user_button, GPIO_INT_EDGE_TO_ACTIVE);
+    ret = gpio_pin_interrupt_configure_dt(user_button, GPIO_INT_EDGE_BOTH);
     if (ret != 0) {
         LOG_ERR("Button interrupt init failed: %d", ret);
         return ret;
@@ -521,6 +598,7 @@ int ble_init(const struct gpio_dt_spec *scan_led_spec,
     k_work_init_delayable(&scan_stop_work, scan_stop_work_handler);
     k_work_init_delayable(&connect_work, connect_work_handler);
     k_work_init_delayable(&reconnect_scan_work, reconnect_scan_work_handler);
+    k_work_init_delayable(&phy_update_work, phy_update_work_handler);
     k_timer_init(&scan_blink_timer, scan_blink_timer_handler, NULL);
 
     ret = bt_enable(NULL);
